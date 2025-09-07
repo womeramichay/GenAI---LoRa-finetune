@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+env/
+.idea/
+.vscode/
+data/raw/
+data/processed/tmp/
+outputs/
+wandb/
+logs/
+.DS_Store
+.ipynb_checkpoints/
+*.safetensors
+*.ckpt
+*.pt
