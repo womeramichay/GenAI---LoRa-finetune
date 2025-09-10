@@ -32,3 +32,6 @@ logs/
 *.safetensors
 *.ckpt
 *.pt
+data/processed/
+runs/
+tmp_hf_check/
