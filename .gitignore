@@ -1,37 +1,47 @@
+# --- Python ---
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# --- Virtual envs ---
 .venv/
+venv/
 env/
+
+# --- IDE / Editor ---
 .idea/
 .vscode/
-data/raw/
-data/processed/tmp/
-outputs/
-wandb/
-logs/
-.DS_Store
+*.code-workspace
+
+# --- Notebooks ---
 .ipynb_checkpoints/
-*.safetensors
-*.ckpt
-*.pt
-__pycache__/
-*.pyc
-.env
-.venv/
-env/
-.idea/
-.vscode/
-data/raw/
-data/processed/tmp/
-outputs/
-wandb/
-logs/
+
+# --- OS cruft ---
 .DS_Store
-.ipynb_checkpoints/
-*.safetensors
-*.ckpt
-*.pt
-data/processed/
-runs/
+Thumbs.db
+desktop.ini
+
+# --- Project data & outputs (keep code clean) ---
+# Everything under data/ is ignored by default; keep readme/placeholders if needed.
+data/**
+!data/.gitkeep
+!data/README.md
+
+# Training runs, logs, caches
+runs/**
+outputs/**
+logs/**
+wandb/
+tmp/
 tmp_hf_check/
+**/.cache/
+
+# --- Model files / large artifacts ---
+*.safetensors
+*.ckpt
+*.pt
