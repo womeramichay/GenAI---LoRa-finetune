@@ -1,53 +1,47 @@
-import argparse, pathlib, re
+# scripts/clean_captions.py
+import argparse, pathlib, re, json
 
-STOPWORDS = {"a", "the", "an", "of", "and", "in", "black", "white", "line", "art", "tattoo", "stencil"}
-STYLE_TRAILER = ", clean line, minimal line-art tattoo, stencil, high contrast, no shading"
+def clean_text(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-def extract_subject(txt: str) -> str:
-    # Keep 2–5 most meaningful tokens from BLIP, drop style/color fillers.
-    words = re.findall(r"[a-z0-9]+", txt.lower())
-    words = [w for w in words if w not in STOPWORDS]
-    # collapse repeated words
-    dedup = []
-    for w in words:
-        if not dedup or dedup[-1] != w:
-            dedup.append(w)
-    # choose up to 4
-    core = " ".join(dedup[:4]).strip()
-    return core or "tattoo motif"
+def default_caption() -> str:
+    return "minimal line-art tattoo, stencil, high contrast, no shading"
 
-def subject_from_filename(p: pathlib.Path) -> str:
-    # fallback from file name, e.g. "owl_sketch_03.png" -> "owl sketch"
-    base = p.stem.lower()
-    base = re.sub(r"[_\-]+", " ", base)
-    base = re.sub(r"\d+", "", base).strip()
-    base = re.sub(r"\s+", " ", base)
-    if not base:
-        return "tattoo motif"
-    # take first 2–3 words
-    return " ".join(base.split()[:3])
+def caption_from_name(p: pathlib.Path) -> str:
+    # optional heuristic from filename tokens
+    base = p.stem.lower().replace("_", " ").replace("-", " ")
+    base = re.sub(r"\d+", "", base)
+    base = re.sub(r"\s+", " ", base).strip()
+    return base or "tattoo design"
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--captions_dir", required=True)
-    ap.add_argument("--images_dir", required=True)  # to fallback on filenames if caption is empty
-    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--img_dir", required=True)                 # data/processed/<dataset>/images
+    ap.add_argument("--out_dir", required=True)                 # data/processed/<dataset>/vanilla
+    ap.add_argument("--append_style", default=", clean line tattoo, high contrast, stencil, no shading")
+    ap.add_argument("--max_words", type=int, default=8)
     args = ap.parse_args()
 
-    cap_dir = pathlib.Path(args.captions_dir)
-    img_dir = pathlib.Path(args.images_dir)
-    out_dir = pathlib.Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    img_dir = pathlib.Path(args.img_dir)
+    out_root = pathlib.Path(args.out_dir)
+    cap_dir = out_root / "captions"
+    cap_dir.mkdir(parents=True, exist_ok=True)
 
-    for img in sorted(img_dir.glob("*.png")):
-        cap_path = cap_dir / f"{img.stem}.txt"
-        raw = cap_path.read_text(encoding="utf-8").strip() if cap_path.exists() else ""
-        subj = extract_subject(raw) if raw else subject_from_filename(img)
-        # enforce template
-        clean = f"{subj}{STYLE_TRAILER}"
-        (out_dir / f"{img.stem}.txt").write_text(clean, encoding="utf-8")
+    count = 0
+    for p in sorted(img_dir.glob("*.png")):
+        words = caption_from_name(p).split()
+        words = words[:args.max_words] if words else default_caption().split()
+        cap = clean_text(" ".join(words)) + args.append_style
+        (cap_dir / f"{p.stem}.txt").write_text(cap.strip(), encoding="utf-8")
+        count += 1
 
-    print(f"Cleaned captions written to: {out_dir.resolve()}")
+    (out_root / "vanilla_meta.json").write_text(
+        json.dumps({"count": count, "append_style": args.append_style}, indent=2),
+        encoding="utf-8"
+    )
+    print(f"Saved {count} vanilla captions → {cap_dir}")
 
 if __name__ == "__main__":
     main()

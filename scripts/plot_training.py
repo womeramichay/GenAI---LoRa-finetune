@@ -1,21 +1,42 @@
 # scripts/plot_training.py
-import argparse, pandas as pd, matplotlib.pyplot as plt, pathlib
+import argparse, pathlib
+import pandas as pd
+import matplotlib.pyplot as plt
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True)
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--csv", nargs="+", required=True, help="One or more CSV log files.")
+    ap.add_argument("--labels", nargs="*", default=None, help="Optional labels (same length as --csv).")
+    ap.add_argument("--out", default=None, help="Output PNG path; if omitted, uses first CSV name with _plot.png")
     args = ap.parse_args()
 
-    df = pd.read_csv(args.csv)
-    out = pathlib.Path(args.out) if args.out else pathlib.Path(args.csv).with_suffix(".png")
+    if args.labels and len(args.labels) != len(args.csv):
+        raise ValueError("labels length must match number of csv files")
 
-    plt.figure()
-    plt.plot(df["step"], df["train_loss"], label="train")
-    plt.plot(df["step"], df["val_loss"], label="val")
-    plt.xlabel("step"); plt.ylabel("loss"); plt.legend(); plt.title("LoRA Training")
-    plt.savefig(out, dpi=160, bbox_inches="tight")
-    print(f"saved plot to {out.resolve()}")
+    plt.figure(figsize=(8,5))
+    for i, path in enumerate(args.csv):
+        df = pd.read_csv(path)
+        label = args.labels[i] if args.labels else pathlib.Path(path).stem
+        if "step" not in df.columns or "train_loss" not in df.columns or "val_loss" not in df.columns:
+            print(f"WARNING: {path} missing expected columns [step, train_loss, val_loss]; skipping.")
+            continue
+        plt.plot(df["step"], df["train_loss"], linestyle="--", alpha=0.7, label=f"{label} (train)")
+        plt.plot(df["step"], df["val_loss"],  linewidth=2.0,              label=f"{label} (val)")
+
+    plt.xlabel("Step")
+    plt.ylabel("Loss (MSE)")
+    plt.title("LoRA training & validation loss")
+    plt.legend()
+    plt.grid(True, alpha=0.25)
+
+    out = args.out
+    if not out:
+        first = pathlib.Path(args.csv[0])
+        out = str(first.with_name(first.stem + "_plot.png"))
+    pathlib.Path(out).parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out, dpi=150)
+    print(f"Saved plot → {out}")
 
 if __name__ == "__main__":
     main()
