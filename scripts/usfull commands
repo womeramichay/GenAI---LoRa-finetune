@@ -1,1 +1,17 @@
-python -m streamlit run app\dashboard.py
+# from your venv where streamlit is installed
+streamlit run app/dashboard.py
+
+
+
+# Example: caption (recompute), train, compare, and plot for all 3
+python scripts/run_variants.py ^
+  --dataset tattoo_v3 ^
+  --variants vanilla blip blip_plus ^
+  --do_caption --do_train --do_compare --do_plot ^
+  --max_steps 250 --rank 8 --alpha 8 --save_every 50 --eval_every 50
+
+
+
+
+
+  python scripts/run_variants.py --dataset tattoo_v3 --variants vanilla --do_train
