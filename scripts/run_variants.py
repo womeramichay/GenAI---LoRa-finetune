@@ -40,16 +40,17 @@ def step_preprocess(raw_dir, out_dir, size):
     run(cmd)
 
 def step_caption_blip(img_dir, cap_dir):
-    cmd = f"{sys.executable} {SCRIPTS/'auto_caption_blip.py'} --images \"{img_dir}\" --out \"{cap_dir}\""
+    cmd = f'{sys.executable} {SCRIPTS/"auto_caption_blip.py"} --img_dir "{img_dir}" --out_dir "{cap_dir}"'
     run(cmd)
 
-def step_enrich_captions(in_dir, out_dir):
-    cmd = f"{sys.executable} {SCRIPTS/'enrich_captions.py'} --in_dir \"{in_dir}\" --out_dir \"{out_dir}\""
+def step_enrich_captions(img_dir, out_dir):
+    cmd = f'{sys.executable} {SCRIPTS/"enrich_captions.py"} --img_dir "{img_dir}" --out_dir "{out_dir}"'
     run(cmd)
 
-def step_clean_captions(img_dir, cap_dir, style_suffix):
-    cmd = f"{sys.executable} {SCRIPTS/'clean_captions.py'} --images \"{img_dir}\" --out \"{cap_dir}\" --style_suffix \"{style_suffix}\""
+def step_clean_captions(img_dir, cap_root, style_suffix):
+    cmd = f'{sys.executable} {SCRIPTS/"clean_captions.py"} --img_dir "{img_dir}" --out_dir "{cap_root}" --append_style "{style_suffix}"'
     run(cmd)
+
 
 def step_train(img_dir, cap_dir, out_dir, steps, batch, grad_accum, save_every, eval_every, rank, alpha, seed):
     cmd = (

@@ -1,478 +1,455 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""
+LoRA fine-tuning for SD1.5 UNet using PEFT backend (diffusers ≥0.29).
+
+Highlights:
+- AMP + grad checkpointing (VRAM friendly for ~6GB GPUs)
+- Grad accumulation defaults to 32 to reduce loss jitter
+- Saves best checkpoint by val loss (weights/best.safetensors)
+- Optional early stopping (--early_stop_patience)
+- Logs to runs/logs/<run_name>/metrics.csv and auto-saves loss plot
+
+Usage (vanilla captions next to images):
+  python scripts/train_lora.py ^
+    --data_images  "data\\processed\\tattoo_v3_subset2000\\images" ^
+    --data_captions "data\\processed\\tattoo_v3_subset2000\\images" ^
+    --output_dir   "runs\\lora\\tattoo_v3_subset2000_vanilla_r4a8_res384_s500"
+
+Usage (BLIP+ captions):
+  python scripts/train_lora.py ^
+    --data_images  "data\\processed\\tattoo_v3_subset2000\\images" ^
+    --data_captions "data\\processed\\tattoo_v3_subset2000\\captions_blip_plus" ^
+    --output_dir   "runs\\lora\\tattoo_v3_subset2000_blip_plus_r4a8_res384_s500"
+"""
 
 import argparse
-import csv
 import json
-import random
-import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Tuple
+from datetime import datetime
+import random
 
+import numpy as np
 import torch
-from accelerate import Accelerator
-from diffusers import DDPMScheduler, StableDiffusionPipeline
-from diffusers.optimization import get_cosine_schedule_with_warmup
-from diffusers.utils import convert_state_dict_to_diffusers
-from peft import LoraConfig
-from peft.utils import get_peft_model_state_dict
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms as T
-from tqdm import tqdm
 
-# Optional: CLIP image-text scoring for qualitative eval
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from diffusers import StableDiffusionPipeline, DDPMScheduler
+from transformers import CLIPTokenizer
+
 try:
-    from transformers import CLIPModel, CLIPProcessor
-    _HAS_CLIP = True
+    from peft import LoraConfig
 except Exception:
-    _HAS_CLIP = False
+    raise SystemExit(
+        "PEFT is required. Please run:  pip install peft==0.10.0\n"
+        "Then re-run this script."
+    )
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
-# ------------------------ Dataset ------------------------ #
-class ImageTextFolder(Dataset):
-    def __init__(
-        self,
-        img_dir: Optional[str],
-        cap_dir: Optional[str],
-        size: int = 512,
-        paths: Optional[List[Path]] = None,
-    ):
-        if paths is not None:
-            self.imgs: List[Path] = sorted(paths)
-        else:
-            p = Path(img_dir)
-            self.imgs: List[Path] = sorted([x for x in p.glob("*.png")])
-        self.cap_dir = Path(cap_dir) if cap_dir else None
-        self.size = size
-        self.tf = T.Compose([T.ToTensor(), T.Normalize([0.5], [0.5])])
+# ------------------
+# Dataset
+# ------------------
+class TattooDataset(Dataset):
+    def __init__(self, image_dir: str, captions_dir: str, resolution: int, vanilla_caption: str):
+        self.image_dir = Path(image_dir)
+        self.captions_dir = Path(captions_dir)
+        self.res = resolution
+        self.fallback = vanilla_caption
+
+        self.items = sorted([p for p in self.image_dir.iterdir() if p.suffix.lower() in IMG_EXTS])
+        if len(self.items) == 0:
+            raise RuntimeError(f"No images found in {self.image_dir}")
 
     def __len__(self):
-        return len(self.imgs)
+        return len(self.items)
 
-    def __getitem__(self, i):
-        p = self.imgs[i]
-        im = Image.open(p).convert("RGB")
-        if im.size != (self.size, self.size):
+    def _load_image(self, path: Path) -> Image.Image:
+        img = Image.open(path).convert("RGB")
+        w, h = img.size
+        m = min(w, h)
+        left = (w - m) // 2
+        top = (h - m) // 2
+        img = img.crop((left, top, left + m, top + m))
+        if m != self.res:
+            img = img.resize((self.res, self.res), Image.BICUBIC)
+        return img
+
+    def _find_caption(self, img_path: Path) -> str:
+        cap = (self.captions_dir / img_path.name).with_suffix(".txt")
+        if cap.exists():
             try:
-                resample = Image.Resampling.LANCZOS
-            except AttributeError:
-                resample = Image.LANCZOS
-            im = im.resize((self.size, self.size), resample)
-        x = self.tf(im)
+                return cap.read_text(encoding="utf-8").strip()
+            except Exception:
+                return self.fallback
+        return self.fallback
 
-        cap = "minimal line-art tattoo, stencil, high-contrast"
-        if self.cap_dir:
-            c = self.cap_dir / (p.stem + ".txt")
-            if c.exists():
-                cap = c.read_text(encoding="utf-8").strip()
-
-        return {"pixel_values": x, "caption": cap}
-
-
-# ------------------------ Utils ------------------------ #
-def _unwrap(model):
-    # compatible with accelerate compiled/unwrap
-    try:
-        from diffusers.utils.torch_utils import is_compiled_module
-        m = Accelerator().unwrap_model(model)
-        return m._orig_mod if is_compiled_module(m) else m
-    except Exception:
-        return model
+    def __getitem__(self, idx):
+        p = self.items[idx]
+        img = self._load_image(p)
+        arr = np.asarray(img).astype(np.float32) / 255.0  # HWC, 0..1
+        arr = arr.transpose(2, 0, 1)                     # CHW
+        arr = (arr * 2.0) - 1.0                          # [-1,1]
+        tensor = torch.from_numpy(arr)
+        caption = self._find_caption(p)
+        return tensor, caption
 
 
-def _make_lora_state(unet) -> Dict[str, torch.Tensor]:
-    unet_unwrapped = _unwrap(unet)
-    state = get_peft_model_state_dict(unet_unwrapped)
-    state = convert_state_dict_to_diffusers(state)
-    return state
+def collate_fn(batch: List[Tuple[torch.Tensor, str]]):
+    imgs = torch.stack([b[0] for b in batch], dim=0)
+    caps = [b[1] for b in batch]
+    return imgs, caps
 
 
-def save_lora(pipe: StableDiffusionPipeline, out_dir: str, tag: str, cfg: dict):
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    weight_name = f"{tag}.safetensors"
-    state = _make_lora_state(pipe.unet)
-    StableDiffusionPipeline.save_lora_weights(
-        save_directory=out,
-        unet_lora_layers=state,
-        safe_serialization=True,
-        weight_name=weight_name,
-    )
-    # save the run config next to weights (for reproducibility)
-    cfg_dir = out.parent / "configs"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    (cfg_dir / f"{tag}.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    print(f"[save] -> {out / weight_name}")
-
-
-@torch.inference_mode()
-def evaluate_noise_mse(
-    pipe: StableDiffusionPipeline,
-    dl: DataLoader,
-    dev: torch.device,
-    noise_sched: DDPMScheduler,
-    max_batches: int = 64,
-    seed: int = 1234,
-) -> float:
-    """Average denoising MSE on the val set (proxy metric)."""
-    pipe.unet.eval()
-    losses = []
-    g = torch.Generator(device=dev).manual_seed(seed)
-
-    for bi, batch in enumerate(dl):
-        if bi >= max_batches:
-            break
-
-        toks = pipe.tokenizer(
-            list(batch["caption"]),
-            padding="max_length",
-            max_length=pipe.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        enc = pipe.text_encoder(toks.input_ids.to(dev))[0]
-
-        px = batch["pixel_values"].to(dev, dtype=torch.float16)
-        lat = pipe.vae.encode(px).latent_dist.sample(generator=g) * 0.18215
-
-        t = torch.randint(
-            0, noise_sched.config.num_train_timesteps, (lat.shape[0],), device=dev, dtype=torch.long, generator=g
-        )
-        eps = torch.randn_like(lat, generator=g)
-        lat_noisy = noise_sched.add_noise(lat, eps, t)
-
-        pred = pipe.unet(lat_noisy, t, encoder_hidden_states=enc).sample
-        loss = torch.nn.functional.mse_loss(pred.float(), eps.float())
-        losses.append(loss.item())
-
-    pipe.unet.train()
-    return float(sum(losses) / max(1, len(losses)))
-
-
-@torch.inference_mode()
-def evaluate_prompts(
-    pipe: StableDiffusionPipeline,
-    prompts: List[str],
-    out_dir: Path,
-    steps: int = 20,
-    guidance: float = 6.5,
-    width: int = 448,
-    height: int = 448,
-    seed: int = 1234,
-    clip_model: Optional["CLIPModel"] = None,
-    clip_processor: Optional["CLIPProcessor"] = None,
-) -> Dict[str, float]:
-    """
-    Generate images for a few fixed prompts at each eval step and (optionally) compute a CLIP score.
-    Saves images into out_dir (e.g., runs/samples/<run_name>/eval_stepXXXX/).
-    """
+# ------------------
+# Save / Eval / Plot
+# ------------------
+def save_lora_safetensors(unet, out_dir: Path, filename: str, meta: dict = None):
     out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = out_dir / "_tmp_attn"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Small-GPU helpers (GTX 1060 etc.)
+    unet.save_attn_procs(str(tmp_dir))
+    src = tmp_dir / "pytorch_lora_weights.safetensors"
+    dst = out_dir / filename
+    if dst.exists():
+        dst.unlink()
+    src.replace(dst)
+
+    for p in tmp_dir.glob("*"):
+        p.unlink()
+    tmp_dir.rmdir()
+
+    if meta is not None:
+        (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    return str(dst)
+
+
+@torch.no_grad()
+def evaluate_noise_mse(unet, vae, tokenizer, text_encoder, noise_sched, dl, device):
+    unet.eval()
+    vae.eval()
+    text_encoder.eval()
+    total = 0.0
+    count = 0
+    use_cuda = device.type == "cuda"
+    amp_dtype = torch.float16 if use_cuda else torch.bfloat16
+    for imgs, caps in dl:
+        imgs = imgs.to(device, non_blocking=True)
+        with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=amp_dtype):
+            lat = vae.encode(imgs).latent_dist.sample() * 0.18215
+            bsz = lat.shape[0]
+            t = torch.randint(0, noise_sched.config.num_train_timesteps, (bsz,), device=device)
+            eps = torch.randn_like(lat)
+            noisy = noise_sched.add_noise(lat, eps, t)
+
+            tokens = tokenizer(
+                caps, padding="max_length", truncation=True,
+                max_length=tokenizer.model_max_length, return_tensors="pt"
+            ).to(device)
+            txt = text_encoder(**tokens).last_hidden_state
+
+            pred = unet(noisy, t, encoder_hidden_states=txt).sample
+            loss = F.mse_loss(pred.float(), eps.float(), reduction="mean")
+
+        total += loss.item() * bsz
+        count += bsz
+    return total / max(count, 1)
+
+
+def plot_loss_csv(csv_path: Path, out_png: Path, title: str):
     try:
-        pipe.enable_model_cpu_offload()
-    except Exception:
-        pipe.enable_sequential_cpu_offload()
-    pipe.enable_attention_slicing()
-    pipe.set_progress_bar_config(disable=True)
-
-    gen = torch.Generator(device=pipe.device)
-    clip_scores = []
-
-    for i, ptxt in enumerate(prompts):
-        gen = gen.manual_seed(seed + i)
-        img = pipe(
-            prompt=ptxt,
-            num_inference_steps=steps,
-            guidance_scale=guidance,
-            width=width,
-            height=height,
-            generator=gen,
-        ).images[0]
-        img.save(out_dir / f"eval_{i:02d}.png")
-
-        if clip_model is not None and clip_processor is not None:
-            inputs = clip_processor(text=[ptxt], images=[img], return_tensors="pt", padding=True)
-            for k in inputs:
-                inputs[k] = inputs[k].to(clip_model.device)
-            outputs = clip_model(**inputs)
-            # logits_per_image ~ cosine similarity in CLIP space (unbounded); squash for readability
-            score = torch.sigmoid(outputs.logits_per_image).item()  # ~0..1
-            clip_scores.append(score)
-
-    return {"clip_score": float(sum(clip_scores) / len(clip_scores))} if clip_scores else {"clip_score": float("nan")}
+        df = pd.read_csv(csv_path)
+        plt.figure(figsize=(8, 5))
+        if "train_loss" in df.columns:
+            plt.plot(df["step"], df["train_loss"], label="train")
+        if "val_loss" in df.columns:
+            plt.plot(df["step"], df["val_loss"], label="val")
+        plt.xlabel("step"); plt.ylabel("loss (noise MSE)")
+        plt.title(title)
+        plt.legend()
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=150)
+        plt.close()
+    except Exception as e:
+        print(f"[plot] failed to save plot: {e}")
 
 
-# ------------------------ Main ------------------------ #
+# ------------------
+# Train
+# ------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_images", required=True)
     ap.add_argument("--data_captions", required=True)
-    ap.add_argument("--output_dir", default="runs/lora/exp")
+    ap.add_argument("--output_dir", default="runs/lora/run")
     ap.add_argument("--pretrained", default="runwayml/stable-diffusion-v1-5")
-
-    ap.add_argument("--resolution", type=int, default=512)
-    ap.add_argument("--rank", type=int, default=8)
+    ap.add_argument("--resolution", type=int, default=384)
+    ap.add_argument("--rank", type=int, default=4)
     ap.add_argument("--alpha", type=int, default=8)
-
     ap.add_argument("--train_text_encoder", action="store_true")
-    ap.add_argument("--max_steps", type=int, default=250)
-    ap.add_argument("--save_every", type=int, default=50)
-    ap.add_argument("--eval_every", type=int, default=50)
-    ap.add_argument("--val_split", type=float, default=0.1)
-
+    ap.add_argument("--max_steps", type=int, default=500)            # <= your request
+    ap.add_argument("--save_every", type=int, default=0)
+    ap.add_argument("--eval_every", type=int, default=100)
+    ap.add_argument("--val_split", type=float, default=0.05)
     ap.add_argument("--batch_size", type=int, default=1)
-    ap.add_argument("--grad_accum", type=int, default=8)
-    ap.add_argument("--clip_grad_norm", type=float, default=1.0)
-
-    ap.add_argument("--lr_unet", type=float, default=1e-4)
-    ap.add_argument("--lr_text", type=float, default=5e-5)
+    ap.add_argument("--grad_accum", type=int, default=32)            # <= your request
+    ap.add_argument("--clip_grad_norm", type=float, default=1.0)     # enable clipping by default
+    ap.add_argument("--lr_unet", type=float, default=8e-5)           # slightly lower LR helps stability
+    ap.add_argument("--lr_text", type=float, default=5e-6)
     ap.add_argument("--weight_decay", type=float, default=1e-2)
-    ap.add_argument("--warmup_steps", type=int, default=100)
-
-    ap.add_argument("--early_stop_patience", type=int, default=6)
-    ap.add_argument("--early_stop_min_delta", type=float, default=1e-4)
+    ap.add_argument("--warmup_steps", type=int, default=0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_dir", default="runs/logs")
-
-    # resume
-    ap.add_argument("--resume_from_dir", default=None, help="Folder containing previous .safetensors")
-    ap.add_argument("--resume_weight_name", default=None, help="Specific file to resume from")
-    ap.add_argument("--resume_step", type=int, default=0)
-
-    # qualitative eval
-    ap.add_argument(
-        "--eval_prompts",
-        nargs="*",
-        default=[
-            "owl, clean line, minimal line-art tattoo, stencil, high contrast, no shading",
-            "wolf head, clean lines, stencil, high contrast, no shading",
-            "lotus flower, minimal line-art tattoo, stencil, high contrast",
-        ],
-    )
-    ap.add_argument("--eval_steps_infer", type=int, default=20)
-    ap.add_argument("--eval_guidance", type=float, default=6.5)
-    ap.add_argument("--eval_width", type=int, default=448)
-    ap.add_argument("--eval_height", type=int, default=448)
-    ap.add_argument("--eval_clip", action="store_true", help="Compute CLIP text-image score at eval time")
-
+    ap.add_argument("--resume_from_dir", default="")
+    ap.add_argument("--eval_steps_infer", type=int, default=16)
+    ap.add_argument("--eval_guidance", type=float, default=6.0)
+    ap.add_argument("--eval_width", type=int, default=384)
+    ap.add_argument("--eval_height", type=int, default=384)
+    ap.add_argument("--eval_clip", action="store_true")
+    ap.add_argument("--vanilla_caption", type=str, default="minimal line-art tattoo, stencil, high-contrast")
+    ap.add_argument("--early_stop_patience", type=int, default=0, help="Stop after this many evals without improvement (0=off)")
+    ap.add_argument("--plot_at_end", action="store_true", help="Write loss plot to runs/logs/<run>/loss.png at the end")
+    ap.add_argument("--debug_samples", type=int, default=0, help="Print this many random sample captions at start")
     args = ap.parse_args()
 
-    random.seed(args.seed)
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_cuda = device.type == "cuda"
+    amp_dtype = torch.float16 if use_cuda else torch.bfloat16
 
-    acc = Accelerator(mixed_precision="fp16", gradient_accumulation_steps=args.grad_accum)
-    dev = acc.device
-    is_main = acc.is_main_process
+    out_dir = Path(args.output_dir)
+    weights_dir = out_dir / "weights"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    weights_dir.mkdir(parents=True, exist_ok=True)
 
-    if is_main:
-        print("Loading SD1.5…")
-    pipe = StableDiffusionPipeline.from_pretrained(args.pretrained, torch_dtype=torch.float16, safety_checker=None)
-    pipe.to(dev)
-    pipe.enable_attention_slicing()
-    pipe.unet.enable_gradient_checkpointing()
-    if args.train_text_encoder:
-        pipe.text_encoder.gradient_checkpointing_enable()
+    log_dir_base = Path(args.log_dir)
+    run_log_dir = log_dir_base / out_dir.name
+    run_log_dir.mkdir(parents=True, exist_ok=True)
+    log_csv = run_log_dir / "metrics.csv"
+    if not log_csv.exists():
+        log_csv.write_text("step,train_loss,val_loss,clip_score\n", encoding="utf-8")
 
-    # Add LoRA adapter
+    # Data
+    ds = TattooDataset(args.data_images, args.data_captions, args.resolution, args.vanilla_caption)
+    n_val = max(1, int(len(ds) * args.val_split))
+    n_train = len(ds) - n_val
+    ds_train, ds_val = random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed))
+
+    print(f"[data] images: {len(ds)} | train: {n_train} | val: {n_val}")
+    print(f"[data] captions_dir: {Path(args.data_captions).resolve()}")
+    if args.debug_samples > 0:
+        idxs = random.sample(range(len(ds)), k=min(args.debug_samples, len(ds)))
+        print("[data] sample captions:")
+        for i in idxs:
+            img_path = ds.items[i]
+            cap = ds._find_caption(img_path)
+            print(f"  - {img_path.name}: {cap[:120]}")
+
+    dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True,
+                          collate_fn=collate_fn)
+    dl_val = DataLoader(ds_val, batch_size=min(4, args.batch_size), shuffle=False, num_workers=0, pin_memory=True,
+                        collate_fn=collate_fn)
+
+    # Model: load pipeline to grab parts
+    print("Loading SD1.5…")
+    pipe = StableDiffusionPipeline.from_pretrained(
+        args.pretrained, torch_dtype=torch.float16 if use_cuda else torch.float32, safety_checker=None
+    )
+    pipe.to(device)
+
+    vae = pipe.vae
+    tokenizer: CLIPTokenizer = pipe.tokenizer
+    text_encoder = pipe.text_encoder
+    unet = pipe.unet
+
+    # Scheduler for training objective
+    noise_sched = DDPMScheduler.from_config(pipe.scheduler.config)
+
+    # VRAM helpers
+    unet.enable_gradient_checkpointing()
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    # PEFT LoRA adapter on UNet
     target_modules = ["to_q", "to_k", "to_v", "to_out.0"]
-    adapter_name = "tattoo"
-    lora_cfg = LoraConfig(r=args.rank, lora_alpha=args.alpha, init_lora_weights="gaussian", target_modules=target_modules)
-    pipe.unet.add_adapter(lora_cfg, adapter_name=adapter_name)
-    pipe.unet.set_adapter(adapter_name)
+    lora_cfg = LoraConfig(
+        r=args.rank,
+        lora_alpha=args.alpha,
+        lora_dropout=0.0,
+        bias="none",
+        target_modules=target_modules,
+        init_lora_weights="gaussian",
+    )
+    unet.add_adapter(lora_cfg)  # adapter name "default"
 
-    # Resume weights into the same adapter name (if given)
+    # Freeze base UNet, train only LoRA; force LoRA params to float32 so GradScaler is happy
+    for p in unet.parameters():
+        p.requires_grad_(False)
+    for n, p in unet.named_parameters():
+        if "lora" in n:
+            p.requires_grad_(True)
+            if p.dtype != torch.float32:
+                p.data = p.data.float()
+
+    # Text encoder optional
+    if args.train_text_encoder:
+        text_encoder.train()
+        for p in text_encoder.parameters():
+            p.requires_grad_(True)
+    else:
+        text_encoder.eval()
+        for p in text_encoder.parameters():
+            p.requires_grad_(False)
+
+    # Optimizer (only LoRA + maybe text encoder)
+    trainable = [p for p in unet.parameters() if p.requires_grad]
+    groups = [{"params": trainable, "lr": args.lr_unet, "weight_decay": args.weight_decay}]
+    if args.train_text_encoder:
+        groups.append({"params": text_encoder.parameters(), "lr": args.lr_text, "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(groups)
+
+    # Resume: load previously-saved LoRA weights if provided
     if args.resume_from_dir:
         try:
-            pipe.load_lora_weights(
-                args.resume_from_dir,
-                weight_name=(args.resume_weight_name if args.resume_weight_name else None),
-                adapter_name=adapter_name,
-            )
-            print(f"[resume] loaded via load_lora_weights: {args.resume_weight_name or '(default)'}")
+            unet.load_attn_procs(args.resume_from_dir, weight_name="autosave_last.safetensors")
+            print(f"[resume] Loaded LoRA from {args.resume_from_dir}/autosave_last.safetensors")
         except Exception as e:
-            print(f"[resume] load_lora_weights failed ({e}); trying state_dict fallback…")
-            from safetensors.torch import load_file
+            try:
+                unet.load_attn_procs(args.resume_from_dir)
+                print(f"[resume] Loaded LoRA from {args.resume_from_dir} (default name)")
+            except Exception as e2:
+                print(f"[resume] Failed to load from {args.resume_from_dir}: {e} / {e2}")
 
-            wpath = Path(args.resume_from_dir) / (args.resume_weight_name or "")
-            state = load_file(str(wpath), device="cpu")
-            # ensure fp32 for trainable tensors
-            for k in list(state.keys()):
-                if state[k].dtype == torch.float16:
-                    state[k] = state[k].float()
-            missing, unexpected = pipe.unet.load_state_dict(state, strict=False)
-            print(f"[resume] loaded state dict: missing={len(missing)} unexpected={len(unexpected)}")
-
-    # Trainable params = LoRA only (cast to fp32 for stability under AMP)
-    params = []
-    for n, p in pipe.unet.named_parameters():
-        req = "lora_" in n.lower()
-        p.requires_grad_(req)
-        if req:
-            p.data = p.data.float()
-            params.append(p)
-
-    if args.train_text_encoder:
-        for n, p in pipe.text_encoder.named_parameters():
-            req = "lora_" in n.lower()
-            p.requires_grad_(req)
-            if req:
-                p.data = p.data.float()
-                params.append(p)
-
-    opt = torch.optim.AdamW(params, lr=args.lr_unet, betas=(0.9, 0.999), weight_decay=args.weight_decay, eps=1e-8)
-    noise_sched = DDPMScheduler.from_pretrained(args.pretrained, subfolder="scheduler")
-
-    # Train/Val split
-    img_dir = Path(args.data_images)
-    all_imgs = sorted(img_dir.glob("*.png"))
-    n_total = len(all_imgs)
-    assert n_total > 0, f"No images found in {img_dir}"
-    n_val = max(1, int(n_total * args.val_split))
-    random.Random(args.seed).shuffle(all_imgs)
-    val_imgs = all_imgs[:n_val]
-    train_imgs = all_imgs[n_val:]
-
-    ds_train = ImageTextFolder(None, args.data_captions, size=args.resolution, paths=train_imgs)
-    ds_val = ImageTextFolder(None, args.data_captions, size=args.resolution, paths=val_imgs)
-
-    dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    dl_val = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
-
-    # LR schedule for remaining steps
-    remaining_steps = max(1, args.max_steps - max(0, args.resume_step))
-    warmup_left = max(0, args.warmup_steps - max(0, args.resume_step))
-    sched = get_cosine_schedule_with_warmup(
-        opt, num_warmup_steps=warmup_left, num_training_steps=remaining_steps
-    )
-
-    # prepare with Accelerate
-    pipe.unet, opt, dl_train, sched = acc.prepare(pipe.unet, opt, dl_train, sched)
-    if args.train_text_encoder:
-        pipe.text_encoder = acc.prepare_model(pipe.text_encoder)
-
-    # Logging
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    exp_tag = f"sd15_lora_r{args.rank}_a{args.alpha}"
-    log_dir = Path(args.log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_csv = log_dir / f"{out_dir.name}_{int(time.time())}.csv"
-    if is_main:
-        with open(log_csv, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["step", "train_loss", "val_loss", "clip_score"])
-
-    # Optional CLIP scorer for eval
-    clip_model = None
-    clip_processor = None
-    if args.eval_clip and _HAS_CLIP and is_main:
-        clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(dev)
-        clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        clip_model.eval()
-    elif args.eval_clip and not _HAS_CLIP and is_main:
-        print("[warn] transformers/CLIP not available. Skipping CLIP score.")
+    # Trackers for best + early stop
+    best_val = float("inf")
+    bad_evals = 0
+    stop_training = False
+    best_path = None
 
     # Train loop
-    global_step = max(0, args.resume_step)
-    best_val, bad_epochs = float("inf"), 0
-    pbar = tqdm(total=args.max_steps, initial=global_step, disable=not is_main)
+    global_step = 0
+    accum = 0
+    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda)
 
-    while global_step < args.max_steps:
-        for batch in dl_train:
-            with acc.accumulate(pipe.unet):
-                toks = pipe.tokenizer(
-                    list(batch["caption"]),
-                    padding="max_length",
-                    max_length=pipe.tokenizer.model_max_length,
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                with torch.no_grad():
-                    enc = pipe.text_encoder(toks.input_ids.to(dev))[0]
+    def do_eval_and_save(step, train_loss_val):
+        nonlocal best_val, bad_evals, stop_training, best_path
+        val_loss = evaluate_noise_mse(unet, vae, tokenizer, text_encoder, noise_sched, dl_val, device)
+        clip_score = float("nan")
 
-                px = batch["pixel_values"].to(dev, dtype=torch.float16)
-                with torch.no_grad():
-                    lat = pipe.vae.encode(px).latent_dist.sample() * 0.18215
+        # log
+        with log_csv.open("a", encoding="utf-8") as f:
+            f.write(f"{step},{train_loss_val:.6f},{val_loss:.6f},{clip_score}\n")
 
-                t = torch.randint(0, noise_sched.config.num_train_timesteps, (lat.shape[0],), device=dev, dtype=torch.long)
-                eps = torch.randn_like(lat)
-                lat_noisy = noise_sched.add_noise(lat, eps, t)
+        # always autosave "last"
+        save_lora_safetensors(unet, weights_dir, "autosave_last.safetensors", meta={
+            "step": step, "rank": args.rank, "alpha": args.alpha, "resolution": args.resolution,
+            "seed": args.seed, "pretrained": args.pretrained,
+        })
 
-                pred = pipe.unet(lat_noisy, t, encoder_hidden_states=enc).sample
-                loss = torch.nn.functional.mse_loss(pred.float(), eps.float())
+        improved = val_loss < best_val - 1e-6
+        if improved:
+            best_val = val_loss
+            bad_evals = 0
+            best_path = save_lora_safetensors(unet, weights_dir, "best.safetensors", meta={
+                "step": step, "rank": args.rank, "alpha": args.alpha, "resolution": args.resolution,
+                "seed": args.seed, "pretrained": args.pretrained, "val_loss": val_loss,
+            })
+            print(f"[eval] step {step} | train_loss={train_loss_val:.4f} | val_loss={val_loss:.4f} -> BEST ✓")
+        else:
+            bad_evals += 1
+            print(f"[eval] step {step} | train_loss={train_loss_val:.4f} | val_loss={val_loss:.4f} -> no improve ({bad_evals})")
 
-                acc.backward(loss)
+        # early stop if enabled
+        if args.early_stop_patience > 0 and bad_evals >= args.early_stop_patience:
+            print(f"[early-stop] No improvement for {bad_evals} evals. Stopping.")
+            stop_training = True
 
-                # Clip only on real optimizer steps
-                if acc.sync_gradients and args.clip_grad_norm and args.clip_grad_norm > 0:
-                    try:
-                        acc.clip_grad_norm_(params, args.clip_grad_norm)
-                    except RuntimeError as e:
-                        if "unscale_() has already been called" in str(e):
-                            pass
-                        else:
-                            raise
+    unet.train()
 
-                opt.step()
-                sched.step()
-                opt.zero_grad(set_to_none=True)
+    while global_step < args.max_steps and not stop_training:
+        for imgs, caps in dl_train:
+            global_step += 1
+            imgs = imgs.to(device, non_blocking=True)
 
-            if acc.sync_gradients:
-                global_step += 1
-                if is_main:
-                    pbar.set_description(f"step {global_step} | loss {loss.item():.4f}")
-                    pbar.update(1)
+            with torch.no_grad(), torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=amp_dtype):
+                latents = vae.encode(imgs).latent_dist.sample() * 0.18215
+                bsz = imgs.shape[0]
+                t = torch.randint(0, noise_sched.config.num_train_timesteps, (bsz,), device=device)
+                eps = torch.randn_like(latents)
+                noisy = noise_sched.add_noise(latents, eps, t)
 
-                if is_main and (global_step % args.save_every == 0 or global_step == args.max_steps):
-                    save_lora(pipe, args.output_dir, f"{exp_tag}_step{global_step}", vars(args))
+                tokens = tokenizer(
+                    caps, padding="max_length", truncation=True,
+                    max_length=tokenizer.model_max_length, return_tensors="pt"
+                ).to(device)
+                txt = text_encoder(**tokens).last_hidden_state
 
-                if is_main and (global_step % args.eval_every == 0 or global_step == args.max_steps):
-                    # Quantitative noise MSE
-                    val_loss = evaluate_noise_mse(pipe, dl_val, dev, noise_sched)
+            with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=amp_dtype):
+                pred = unet(noisy, t, encoder_hidden_states=txt).sample
+                loss = F.mse_loss(pred.float(), eps.float(), reduction="mean")
 
-                    # Qualitative prompt-based eval
-                    eval_dir = out_dir.parent / "samples" / out_dir.name / f"eval_step{global_step:04d}"
-                    clip_val = float("nan")
-                    try:
-                        res = evaluate_prompts(
-                            pipe,
-                            args.eval_prompts,
-                            eval_dir,
-                            steps=args.eval_steps_infer,
-                            guidance=args.eval_guidance,
-                            width=args.eval_width,
-                            height=args.eval_height,
-                            seed=args.seed,
-                            clip_model=clip_model,
-                            clip_processor=clip_processor,
-                        )
-                        clip_val = res.get("clip_score", float("nan"))
-                    except Exception as e:
-                        print(f"[eval-image] generation failed: {e}")
+            loss = loss / args.grad_accum
+            scaler.scale(loss).backward()
+            accum += 1
 
-                    with open(log_csv, "a", newline="", encoding="utf-8") as f:
-                        csv.writer(f).writerow([global_step, float(loss.item()), float(val_loss), clip_val])
-                    print(f"[eval] step {global_step} | train {loss.item():.4f} | val {val_loss:.4f} | clip {clip_val:.4f}")
+            if accum % args.grad_accum == 0:
+                if args.clip_grad_norm > 0:
+                    # Only unscale if we actually plan to clip
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(trainable, args.clip_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                accum = 0
 
-                    # Early stopping on val_loss
-                    if val_loss + args.early_stop_min_delta < best_val:
-                        best_val = val_loss
-                        bad_epochs = 0
-                        save_lora(pipe, args.output_dir, f"{exp_tag}_best", vars(args))
-                    else:
-                        bad_epochs += 1
-                        if bad_epochs >= args.early_stop_patience:
-                            print(f"[early-stop] no improvement for {bad_epochs} evals; stopping at step {global_step}.")
-                            global_step = args.max_steps
-                            break
+            if global_step % 10 == 0:
+                print(f"step {global_step} | loss {loss.item() * args.grad_accum:.4f}")
+
+            if args.eval_every > 0 and global_step % args.eval_every == 0:
+                do_eval_and_save(global_step, loss.item() * args.grad_accum)
+                if stop_training:
+                    break
 
             if global_step >= args.max_steps:
                 break
+        # break outer loop on early stop
+        if stop_training:
+            break
 
-    if is_main:
-        save_lora(pipe, args.output_dir, f"{exp_tag}_final", vars(args))
-        print("Done.")
+    final_path = save_lora_safetensors(unet, weights_dir, "final.safetensors", meta={
+        "step": global_step,
+        "rank": args.rank,
+        "alpha": args.alpha,
+        "resolution": args.resolution,
+        "seed": args.seed,
+        "pretrained": args.pretrained,
+    })
+    print(f"[done] Finished {global_step} steps. Saved final LoRA -> {final_path}")
+    if best_path:
+        print(f"[info] Best checkpoint by val_loss: {best_path}")
+    else:
+        print("[info] No best checkpoint recorded (maybe no evals?)")
+
+    # Save args for traceability
+    (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2), encoding="utf-8")
+
+    # Auto-plot if requested
+    if args.plot_at_end:
+        plot_loss_csv(
+            log_csv,
+            run_log_dir / "loss.png",
+            title=out_dir.name
+        )
+        print(f"[plot] Saved loss curve -> {run_log_dir / 'loss.png'}")
 
 
 if __name__ == "__main__":
