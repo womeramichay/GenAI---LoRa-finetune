@@ -50,27 +50,4 @@
 - **Reproducible**: one-button `main.py` orchestrates the pipeline, and a Streamlit dashboard visualizes results.
 - **Storage & VRAM aware**: lightweight eval images, large `save_every` (keeps best/final), CPU offload at inference.
 
----
 
-## Repository layout
-tattoo-genai/
-├─ data/
-│ ├─ raw/ # source PNGs
-│ └─ processed/<dataset>/
-│ ├─ images/ # preprocessed images (512x512)
-│ ├─ captions_blip/ # BLIP captions
-│ └─ captions_blip_plus/ # BLIP+ captions
-├─ runs/
-│ ├─ lora/ # LoRA weights per run (best/final)
-│ ├─ logs/ # CSV logs
-│ └─ samples/ # eval/ad-hoc images
-├─ scripts/
-│ ├─ preprocess.py # resize/crop images
-│ ├─ auto_caption_blip.py # BLIP baseline captions
-│ ├─ enrich_captions.py # BLIP+ enrichment (suffix + dedup)
-│ ├─ train_lora.py # LoRA trainer (MSE + eval images + CLIP)
-│ ├─ compare_lora_infer.py # side-by-side inference for runs
-│ └─ plot_training.py # plot CSV logs
-├─ app/
-│ └─ dashboard.py # Streamlit dashboard (auto-discovers runs)
-└─ main.py # one-button pipeline driver (idempotent)
