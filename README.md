@@ -1,10 +1,5 @@
 # Tattoo LoRA — Tattoo line-art generator (Stable Diffusion 1.5 + LoRA)
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
-[![Diffusers](https://img.shields.io/badge/HF-diffusers-ffd21e.svg)](https://github.com/huggingface/diffusers)
-[![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-ff4b4b.svg)](https://streamlit.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ## What & Why (Model + Method)
 
