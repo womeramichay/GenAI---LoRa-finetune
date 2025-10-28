@@ -1,81 +1,64 @@
-# Tattoo LoRA — Tattoo line-art generator (Stable Diffusion 1.5 + LoRA)
+**What I built**
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c.svg)](https://pytorch.org/)
-[![Diffusers](https://img.shields.io/badge/HF-diffusers-ffd21e.svg)](https://github.com/huggingface/diffusers)
-[![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-ff4b4b.svg)](https://streamlit.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+I fine-tuned Stable Diffusion 1.5 to generate clean, high-contrast tattoo line art.
+Instead of retraining the whole model, I trained small adapter layers using LoRA.
+These adapters are lightweight files you can load on top of the base model.
 
-## What & Why (Model + Method)
+Why this base model:
 
-**Model used:** `runwayml/stable-diffusion-v1-5` (SD-1.5) fine-tuned with **LoRA** (Low-Rank Adaptation) on tattoo line-art images.
+Stable Diffusion 1.5 is well understood, has great of community tools, and runs on a single consumer GPU. It gives predictable results and reproducible checkpoints.
 
-**Why SD-1.5?**
-- Mature, well-documented base model with strong community tooling (Diffusers, PEFT/LoRA).
-- Lightweight enough for **single-GPU training** (≈6–8 GB VRAM) while still producing clean, high-contrast line art.
-- Reproducible checkpoints and predictable behavior for portfolio projects.
+**Why LoRA:**
+* Small adapters instead of full fine-tuning save time and resorces.
+* Efficient: I train a few million adapter weights instead of the entire network.
+* Fits on everyday hardware: I used my personal PC and GPU, which let me learn from many images while keeping memory low and runtime reasonable, The LoRA weights are small and easy to store.
+  
+**Data & preprocessing**
 
-**Why LoRA (instead of full finetune / DreamBooth)?**
-- **Parameter-efficient:** we only train a few million adapter weights (rank *r* ≈ 8), not the whole UNet.
-- **Fits on consumer GPUs:** works with batch_size=1 + gradient accumulation.
-- **Composable & portable:** LoRA weights are small `.safetensors` you can load on top of SD-1.5 anywhere.
+* Dataset: Tattoo images from [Kaggle](https://www.kaggle.com/datasets/faiqueali/tattoos).
+* Cleaning: Convert to RGB, center-crop to a square, and resize, I trained at 384x384 (I started with 512x512 buti change from time limitation). This reduces memory use and increases throughput on a single GPU, which speeds up iteration.
+* Split: I keep 5% of the images aside for validation so I can track generalization during training.
 
----
+**Captions:**
 
-## Method (Training & Evaluation)
+I guide the model with captions and tried three sources:
+1) vanilla – a short, generic tattoo prompt used for every image (simple fallback).
+2) BLIP – automatic per-image captions from a pretrained BLIP model.
+3) BLIP+ – the same BLIP captions but enriched with style hints like “clean line tattoo, stencil, high contrast.”
 
-### Training objective (how we train)
-- We keep the SD-1.5 **UNet** and **VAE/Text Encoder** frozen (optionally LoRA-train the text encoder).
-- Inject LoRA adapters into the UNet’s **attention projections**: `to_q`, `to_k`, `to_v`, `to_out.0`.
-- Supervision: **denoising MSE** (predict the noise ε) with the SD-1.5 DDPM scheduler.
-- Optimizer: **AdamW** with cosine schedule + warmup, gradient accumulation, optional grad-norm clipping.
-- Data: line-art PNGs resized to 512×512; captions vary by variant (see below).
+**Why BLIP:**
+It gives me reliable captions out of the box, runs fast on my setup, and integrates cleanly with the LoRA training pipeline so I get consistent supervision without manual labeling. BLIP+ simply nudges the captions toward the look I want (line-art, high-contrast).
 
-### Captioning variants (what we compare)
-| Variant   | Caption source                                                              | When to use                           |
-|-----------|-----------------------------------------------------------------------------|---------------------------------------|
-| `vanilla` | Fixed style string inside trainer: *“minimal line-art tattoo, stencil, high-contrast”* | Baseline style adherence              |
-| `blip`    | Auto captions from **BLIP** (`Salesforce/blip-image-captioning-large`)      | Natural language descriptions         |
-| `blip_plus` | BLIP + style suffix: *“clean line tattoo, high contrast, stencil, no shading”* (dedup + trim) | Stronger style conditioning |
+**How I trained:**
 
-### Evaluation (how we measure)
-1. **Validation denoising MSE** on a held-out set (proxy for over/under-fitting). Logged to CSV as `val_loss`.
-2. **Qualitative eval images** every *N* steps from fixed prompts (same seeds → apples-to-apples across runs).
-3. **Optional CLIP score** (`openai/clip-vit-base-patch32`): average text-image similarity for the fixed prompts. Logged as `clip_score`.
+* I keep the base model parts fixed (UNet, VAE, text encoder) and insert LoRA adapters inside the UNet attention blocks (to_q, to_k, to_v, to_out.0).
+* The learning target is standard for diffusion models: predict the added noise during denoising (MSE loss).
+* I use AdamW, warmup where helpful, optional gradient-norm clipping, and mixed precision for speed and lower memory.
 
-> Logs are in `runs/logs/*.csv` with columns: `step, train_loss, val_loss, clip_score`.  
-> Eval images are saved under `runs/samples/<run_name>/eval_stepXXXX/`.
+**Training settings**
+Effective larger batches without extra VRAM: I keep the per-step batch small and use gradient accumulation to simulate a larger batch. This gives more stable updates while staying within memory limits.
 
----
+**Training steps:**
+I ran ~500 steps (quick checks) and ~1000 steps (longer runs) to compare curves. Short runs help me iterate, longer runs push quality once settings look good.
 
-## Highlights
+**Model selection**
+After each evaluation I save a checkpoint, and I also save a final one at the end. I can pick the checkpoint with the lowest validation loss as the best generalizing weights.
 
-- **End-to-end workflow**: preprocessing → BLIP/BLIP+ captioning → LoRA training → evaluation → inference.
-- **Three variants** to compare style conditioning approaches.
-- **Reproducible**: one-button `main.py` orchestrates the pipeline, and a Streamlit dashboard visualizes results.
-- **Storage & VRAM aware**: lightweight eval images, large `save_every` (keeps best/final), CPU offload at inference.
+**Results and takeaways**
 
----
+To compare caption strategies I fixed the random seed and trained three variants with identical hyper-parameters: vanilla, BLIP, and BLIP+. The training/validation noise-MSE curves are nearly overlapping, and I did not observe a consistent, statistically meaningful gap between the variants under these settings. In short: on this dataset and budget (≈2000 images, 5% val, 512–1024 steps, LoRA r=8,a=8 @ 384²), caption choice did not materially change the denoising loss.
 
-## Repository layout
-tattoo-genai/
-├─ data/
-│ ├─ raw/ # source PNGs
-│ └─ processed/<dataset>/
-│ ├─ images/ # preprocessed images (512x512)
-│ ├─ captions_blip/ # BLIP captions
-│ └─ captions_blip_plus/ # BLIP+ captions
-├─ runs/
-│ ├─ lora/ # LoRA weights per run (best/final)
-│ ├─ logs/ # CSV logs
-│ └─ samples/ # eval/ad-hoc images
-├─ scripts/
-│ ├─ preprocess.py # resize/crop images
-│ ├─ auto_caption_blip.py # BLIP baseline captions
-│ ├─ enrich_captions.py # BLIP+ enrichment (suffix + dedup)
-│ ├─ train_lora.py # LoRA trainer (MSE + eval images + CLIP)
-│ ├─ compare_lora_infer.py # side-by-side inference for runs
-│ └─ plot_training.py # plot CSV logs
-├─ app/
-│ └─ dashboard.py # Streamlit dashboard (auto-discovers runs)
-└─ main.py # one-button pipeline driver (idempotent)
+Why this can happen:
+Noise-MSE measures the diffusion objective, not image quality; different captions can yield similar MSE.
+With LoRA capacity (r=8) and short training horizon, the model may be bottlenecked by steps/capacity rather than caption richness.
+Line-art structure carries strong signal generic prompts already align well, so BLIP/BLIP+ adds limited incremental supervision here.
+
+**Next Step**
+Train longer (2k–4k steps) or increase LoRA capacity (e.g., r=16) and/or train the text encoder.
+Raise resolution to 512x512 and keep effective batch large (e.g., bs=4, grad-accum=16).
+Evaluate generation quality directly: fixed prompt grids across checkpoints (use the compare script), CLIP-score on generated sets, or human side-by-side ratings.
+Try caption dropout / mix “vanilla” + BLIP to reduce over-conditioning; or cleaner captions (deduplicate, lowercase, remove stopwords).
+
+
+
+
