@@ -1,50 +1,48 @@
-What I built-
-I fine-tuned the “Stable Diffusion 1.5” image generator to produce clean, high-contrast tattoo line art. Instead of retraining the whole model I trained small adapter layers (LoRA method). These adapters are lightweight files which you can load on top of the base model.
+What I built
+
+I fine-tuned Stable Diffusion 1.5 to generate clean, high-contrast tattoo line art.
+Instead of retraining the whole model, I trained small adapter layers using LoRA.
+These adapters are lightweight files you can load on top of the base model.
 
 Why this base model:
-Stable Diffusion 1.5 is well understood, has plenty of community tools, and runs on a single consumer GPU. It gives predictable results and reproducible checkpoints—perfect for a portfolio project.
 
-Why LoRA: (small adapters) instead of full fine-tuning
+Stable Diffusion 1.5 is well understood, has great of community tools, and runs on a single consumer GPU. It gives predictable results and reproducible checkpoints.
 
-* It is efficient: only train a few million adapter weights instade the entire network.
+Why LoRA:
+* Small adapters instead of full fine-tuning save time and resorces.
+* Efficient: I train a few million adapter weights instead of the entire network.
+* Fits on everyday hardware: I used my personal PC and GPU, which let me learn from many images while keeping memory low and runtime reasonable, The LoRA weights are small and easy to store.
+  
+Data & preprocessing (before training)
 
-* It fits on everyday hardware: I useded my personal PC and GPU, in that why i could learn from many images and in the same time keep memory low still and have a resonable runtime.
+* Dataset: Tattoo images from [Kaggle](https://www.kaggle.com/datasets/faiqueali/tattoos).
+* Cleaning: Convert to RGB, center-crop to a square, and resize, I trained at 384×384. This reduces memory use and increases throughput on a single GPU, which speeds up iteration.
+* Split: I keep 5% of the images aside for validation so I can track generalization during training.
 
-How I trained-
-First i used images of tattos [kaggle](https://www.kaggle.com/datasets/faiqueali/tattoos)
-I keep the base model parts fixed and add LoRA adapters inside the attention blocks.
+Captions:
 
-The learning target is simple and standard for diffusion models: predict the noise that was added to an image while denoising.
+I guide the model with captions and tried three sources:
+1) vanilla – a short, generic tattoo prompt used for every image (simple fallback).
+2) BLIP – automatic per-image captions from a pretrained BLIP model.
+3) BLIP+ – the same BLIP captions but enriched with style hints like “clean line tattoo, stencil, high contrast.”
 
-I use AdamW as the optimizer, warmup where helpful, optional gradient-norm clipping, and mixed precision for speed and lower memory.
+Why BLIP?
+It gives me reliable captions out of the box, runs fast on my setup, and integrates cleanly with the LoRA training pipeline so I get consistent supervision without manual labeling. BLIP+ simply nudges the captions toward the look I want (line-art, high-contrast).
 
-I used captions guide the learning. I tried three caption sources:
+How I trained:
 
-1) vanilla: a short, generic tattoo prompt used for every image (fallback, no .txt files needed).
+* I keep the base model parts fixed (UNet, VAE, text encoder) and insert LoRA adapters inside the UNet attention blocks (to_q, to_k, to_v, to_out.0).
 
-2) BLIP: automatic captions generated from each image using blip model.
+* The learning target is standard for diffusion models: predict the added noise during denoising (MSE loss).
 
-3) BLIP_PLUS: the same BLIP captions but enriched with tattoo-style hints (e.g., “clean line tattoo, stencil, high contrast”).
+* I use AdamW, warmup where helpful, optional gradient-norm clipping, and mixed precision for speed and lower memory.
 
-I chose to use blip model 
+**Training settings I tuned to learn faster from more images
 
-During this project i started with train
-What I changed to learn faster and from more images
+Effective larger batches without extra VRAM: I keep the per-step batch small and use gradient accumulation to simulate a larger batch. This gives more stable updates while staying within memory limits.
 
-Image size: we trained at 384×384 (not 512×512). This uses less memory and lets us see more mini-batches per hour, which usually improves results faster on a single GPU.
+Training steps: I ran ~500 steps (quick checks) and ~1000 steps (longer runs) to compare curves. Short runs help me iterate; longer runs push quality once settings look good.
 
-“Bigger” batches without extra memory: we keep the per-step batch small (so it fits in memory) and accumulate gradients over several mini-batches before taking an optimizer step. This gives the effect of a larger batch—more stable updates—without needing more VRAM.
+Model selection
 
-Training steps: we ran both ~500 steps (quick runs) and ~1000 steps (longer runs) to compare curves. Short runs help iterate on settings; longer runs push quality once settings look good.
-
-Validation split: we keep 5% of images aside for validation and measure the same loss there every N steps. This tells us when the model is actually improving and lets us pick a good checkpoint.
-
-Picking the weights: after each evaluation we save a checkpoint; at the end we also save the final one. You can select the checkpoint with the lowest validation loss (often the best generalization).
-
-Outcome
-
-All three variants trained cleanly on a single Windows machine.
-
-Loss curves and CSV logs are saved per run so you can compare vanilla vs. blip vs. blip_plus.
-
-In practice, blip_plus captions often give nicer prompts for generation, while blip and vanilla are good baselines for speed and sanity checks.
+After each evaluation I save a checkpoint, and I also save a final one at the end. I can pick the checkpoint with the lowest validation loss as the best generalizing weights.
