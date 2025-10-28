@@ -1,53 +1,50 @@
-# Tattoo LoRA — Tattoo line-art generator (Stable Diffusion 1.5 + LoRA)
+What I built-
+I fine-tuned the “Stable Diffusion 1.5” image generator to produce clean, high-contrast tattoo line art. Instead of retraining the whole model I trained small adapter layers (LoRA method). These adapters are lightweight files which you can load on top of the base model.
 
+Why this base model:
+Stable Diffusion 1.5 is well understood, has plenty of community tools, and runs on a single consumer GPU. It gives predictable results and reproducible checkpoints—perfect for a portfolio project.
 
-## What & Why (Model + Method)
+Why LoRA: (small adapters) instead of full fine-tuning
 
-**Model used:** `runwayml/stable-diffusion-v1-5` (SD-1.5) fine-tuned with **LoRA** (Low-Rank Adaptation) on tattoo line-art images.
+* It is efficient: only train a few million adapter weights instade the entire network.
 
-**Why SD-1.5?**
-- Mature, well-documented base model with strong community tooling (Diffusers, PEFT/LoRA).
-- Lightweight enough for **single-GPU training** (≈6–8 GB VRAM) while still producing clean, high-contrast line art.
-- Reproducible checkpoints and predictable behavior for portfolio projects.
+* It fits on everyday hardware: I useded my personal PC and GPU, in that why i could learn from many images and in the same time keep memory low still and have a resonable runtime.
 
-**Why LoRA (instead of full finetune / DreamBooth)?**
-- **Parameter-efficient:** we only train a few million adapter weights (rank *r* ≈ 8), not the whole UNet.
-- **Fits on consumer GPUs:** works with batch_size=1 + gradient accumulation.
-- **Composable & portable:** LoRA weights are small `.safetensors` you can load on top of SD-1.5 anywhere.
+How I trained-
+First i used images of tattos [kaggle](https://www.kaggle.com/datasets/faiqueali/tattoos)
+I keep the base model parts fixed and add LoRA adapters inside the attention blocks.
 
----
+The learning target is simple and standard for diffusion models: predict the noise that was added to an image while denoising.
 
-## Method (Training & Evaluation)
+I use AdamW as the optimizer, warmup where helpful, optional gradient-norm clipping, and mixed precision for speed and lower memory.
 
-### Training objective (how we train)
-- We keep the SD-1.5 **UNet** and **VAE/Text Encoder** frozen (optionally LoRA-train the text encoder).
-- Inject LoRA adapters into the UNet’s **attention projections**: `to_q`, `to_k`, `to_v`, `to_out.0`.
-- Supervision: **denoising MSE** (predict the noise ε) with the SD-1.5 DDPM scheduler.
-- Optimizer: **AdamW** with cosine schedule + warmup, gradient accumulation, optional grad-norm clipping.
-- Data: line-art PNGs resized to 512×512; captions vary by variant (see below).
+I used captions guide the learning. I tried three caption sources:
 
-### Captioning variants (what we compare)
-| Variant   | Caption source                                                              | When to use                           |
-|-----------|-----------------------------------------------------------------------------|---------------------------------------|
-| `vanilla` | Fixed style string inside trainer: *“minimal line-art tattoo, stencil, high-contrast”* | Baseline style adherence              |
-| `blip`    | Auto captions from **BLIP** (`Salesforce/blip-image-captioning-large`)      | Natural language descriptions         |
-| `blip_plus` | BLIP + style suffix: *“clean line tattoo, high contrast, stencil, no shading”* (dedup + trim) | Stronger style conditioning |
+1) vanilla: a short, generic tattoo prompt used for every image (fallback, no .txt files needed).
 
-### Evaluation (how we measure)
-1. **Validation denoising MSE** on a held-out set (proxy for over/under-fitting). Logged to CSV as `val_loss`.
-2. **Qualitative eval images** every *N* steps from fixed prompts (same seeds → apples-to-apples across runs).
-3. **Optional CLIP score** (`openai/clip-vit-base-patch32`): average text-image similarity for the fixed prompts. Logged as `clip_score`.
+2) BLIP: automatic captions generated from each image using blip model.
 
-> Logs are in `runs/logs/*.csv` with columns: `step, train_loss, val_loss, clip_score`.  
-> Eval images are saved under `runs/samples/<run_name>/eval_stepXXXX/`.
+3) BLIP_PLUS: the same BLIP captions but enriched with tattoo-style hints (e.g., “clean line tattoo, stencil, high contrast”).
 
----
+I chose to use blip model 
 
-## Highlights
+During this project i started with train
+What I changed to learn faster and from more images
 
-- **End-to-end workflow**: preprocessing → BLIP/BLIP+ captioning → LoRA training → evaluation → inference.
-- **Three variants** to compare style conditioning approaches.
-- **Reproducible**: one-button `main.py` orchestrates the pipeline, and a Streamlit dashboard visualizes results.
-- **Storage & VRAM aware**: lightweight eval images, large `save_every` (keeps best/final), CPU offload at inference.
+Image size: we trained at 384×384 (not 512×512). This uses less memory and lets us see more mini-batches per hour, which usually improves results faster on a single GPU.
 
+“Bigger” batches without extra memory: we keep the per-step batch small (so it fits in memory) and accumulate gradients over several mini-batches before taking an optimizer step. This gives the effect of a larger batch—more stable updates—without needing more VRAM.
 
+Training steps: we ran both ~500 steps (quick runs) and ~1000 steps (longer runs) to compare curves. Short runs help iterate on settings; longer runs push quality once settings look good.
+
+Validation split: we keep 5% of images aside for validation and measure the same loss there every N steps. This tells us when the model is actually improving and lets us pick a good checkpoint.
+
+Picking the weights: after each evaluation we save a checkpoint; at the end we also save the final one. You can select the checkpoint with the lowest validation loss (often the best generalization).
+
+Outcome
+
+All three variants trained cleanly on a single Windows machine.
+
+Loss curves and CSV logs are saved per run so you can compare vanilla vs. blip vs. blip_plus.
+
+In practice, blip_plus captions often give nicer prompts for generation, while blip and vanilla are good baselines for speed and sanity checks.
