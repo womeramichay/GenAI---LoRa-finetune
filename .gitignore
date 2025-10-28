@@ -1,47 +1,25 @@
-# --- Python ---
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.so
-*.egg-info/
-dist/
-build/
-
-# --- Virtual envs ---
+@'
+# env & IDE
 .venv/
-venv/
 env/
-
-# --- IDE / Editor ---
-.idea/
+*.pyc
+__pycache__/
 .vscode/
-*.code-workspace
+.idea/
 
-# --- Notebooks ---
-.ipynb_checkpoints/
+# datasets
+/data/
+/data_raw/
+/data/processed/
 
-# --- OS cruft ---
-.DS_Store
-Thumbs.db
-desktop.ini
+# runs: ignore all by default
+/runs/*
 
-# --- Project data & outputs (keep code clean) ---
-# Everything under data/ is ignored by default; keep readme/placeholders if needed.
-data/**
-!data/.gitkeep
-!data/README.md
+# keep logs (csv/png) for every run
+!/runs/logs/**
+# keep per-run metadata (but still ignore weights)
+!/runs/lora/**/run_meta.json
 
-# Training runs, logs, caches
-runs/**
-outputs/**
-logs/**
-wandb/
-tmp/
-tmp_hf_check/
-**/.cache/
-
-# --- Model files / large artifacts ---
-*.safetensors
-*.ckpt
-*.pt
+# still ignore all weights/artifacts by default
+/runs/lora/**/weights/**
+'@ | Out-File -Encoding UTF8 .gitignore
