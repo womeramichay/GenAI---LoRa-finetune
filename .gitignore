@@ -1,25 +1,40 @@
-@'
-# env & IDE
-.venv/
-env/
-*.pyc
+# --- Python artifacts ---
 __pycache__/
-.vscode/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+
+# --- Virtual envs / dotenv ---
+.venv/
+venv/
+.env
+.env.*
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
 .idea/
+.vscode/
 
-# datasets
-/data/
-/data_raw/
-/data/processed/
+# --- Data (raw + processed; keep out of git) ---
+data/
 
-# runs: ignore all by default
-/runs/*
+# --- Training artifacts ---
+# Ignore everything in runs/ ...
+runs/*
+# ...but KEEP logs (metrics.csv, loss.png, comparisons, etc.)
+!runs/logs/
+!runs/logs/**
 
-# keep logs (csv/png) for every run
-!/runs/logs/**
-# keep per-run metadata (but still ignore weights)
-!/runs/lora/**/run_meta.json
+# --- Caches / misc outputs ---
+cache/
+outputs/
+wandb/
 
-# still ignore all weights/artifacts by default
-/runs/lora/**/weights/**
-'@ | Out-File -Encoding UTF8 .gitignore
+# --- Large model files (keep these out unless using Git LFS) ---
+*.safetensors
+*.ckpt
+*.pt
